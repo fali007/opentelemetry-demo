@@ -40,6 +40,7 @@ services:
       - LLM_MODEL
       - API_KEY
       - USE_VCR
+      - VCR_MATCH_THRESHOLD
       - OPENAI_API_KEY=${API_KEY}
       - APPLICATION_ENDPOINT=frontend:8080
       - OTEL_EXPORTER_OTLP_INSECURE=true
