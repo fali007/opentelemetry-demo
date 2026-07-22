@@ -175,7 +175,7 @@ def body_similarity(r1, r2):
     last_ratio = SequenceMatcher(
         None, _stringify(n1[-1]), _stringify(n2[-1])
     ).ratio()
-
+    # Adding more weight to the recent message
     return 0.4 * full_ratio + 0.6 * last_ratio
 
 
@@ -209,9 +209,9 @@ VCR = vcr.VCR(
 VCR.register_matcher("similar_body", similar_body_matcher)
 
 
-# vcrpy's default playback returns the FIRST recorded request that matches. With
-# a fuzzy matcher several recordings may clear the threshold, so "first" can be
-# the wrong turn. Patch playback to instead return the CLOSEST unplayed match.
+# vcrpy's by default returns the FIRST recorded request that matches. With
+# a fuzzy matcher several recordings may clear the threshold.
+# Patch playback to instead return the CLOSEST match.
 def _install_best_match_playback():
     from vcr.cassette import Cassette
     from vcr.errors import UnhandledHTTPRequestError
