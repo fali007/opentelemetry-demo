@@ -52,6 +52,11 @@ def normalize_body(request):
 
 
 def clean_response(response):
+    status_code = response.get("status", {}).get("code")
+    if status_code is not None and not (200 <= int(status_code) < 300):
+        logging.warning("VCR: not recording response (HTTP %s)", status_code)
+        return None
+
     response["headers"] = {}
     try:
         body = response.get("body", {}).get("string")
@@ -59,6 +64,12 @@ def clean_response(response):
             body = body.decode("utf-8")
 
         data = json.loads(body)
+
+        if isinstance(data, dict) and "error" in data and "choices" not in data:
+            logging.warning(
+                "VCR: not recording response (provider error payload)"
+            )
+            return None
         # id/created are required by the openai response schema, so they are
         # normalized to fixed values instead of removed, keeping fixtures
         # deterministic without failing response validation on replay.
