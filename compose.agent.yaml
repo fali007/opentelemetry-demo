@@ -128,3 +128,14 @@ services:
     depends_on:
       chatbot:
         condition: service_started
+
+  # Patch the load generator (defined in compose.yaml) so its k6 script can
+  # send agentic traffic directly to the agent's /prompt endpoint.
+  load-generator:
+    environment:
+      - AGENT_ENDPOINT
+      - AGENT_PORT
+      - AGENT_PROMPT_TIMEOUT
+    depends_on:
+      agent:
+        condition: service_started
