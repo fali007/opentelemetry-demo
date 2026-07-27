@@ -5,20 +5,21 @@
 
 """File-backed cache for LLM chat-completion requests.
 
-Every interaction is stored as one JSON file named after the SHA-256 of
-its canonicalized request:
+Each model's interactions live in a single append-only JSONL file, one
+`{"digest", "request", "response"}` document per line:
 
-    <LLM_CACHE_DIR>/<model>/<sha256>.json  ->  {"request", "response"}
+    <LLM_CACHE_DIR>/<model>.jsonl
 
-Lookups try an exact digest match first (an O(1) dict or file probe),
-then fall back to fuzzy matching over an in-memory index so that
-near-identical requests (e.g. MCP-wrapped tool results) can reuse a
-stored response. Writes create a temp file and `os.replace` it into
-place, so concurrent writers -- asyncio tasks, sync callers, or several
-agent replicas sharing the fixtures volume -- can never corrupt an entry
-and readers can never observe a partial one. Entries written by other
-replicas are picked up by the digest file probe and by re-scanning the
-directory on fuzzy misses.
+All entries are kept in an in-memory index keyed by the SHA-256 of the
+canonicalized request. Lookups try an exact digest match first, then
+fall back to fuzzy matching so that near-identical requests (e.g.
+MCP-wrapped tool results) can reuse a stored response. On an exact miss
+the file tail is re-read to pick up entries appended by other replicas
+sharing the fixtures volume. Writes append one line while holding an
+exclusive `flock`, so concurrent writers -- asyncio tasks, sync
+callers, or several agent replicas -- never interleave; a line left
+truncated by a crashed writer is healed by the next append and skipped
+by loaders.
 
 Modes (`LLM_CACHE_MODE`): `hybrid` serves cached responses and records
 misses from the live LLM; `replay` never calls the live LLM and raises
@@ -28,12 +29,12 @@ the result; `off` disables the cache entirely.
 
 import asyncio
 import copy
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import re
-import tempfile
 import threading
 from difflib import SequenceMatcher
 
@@ -172,28 +173,28 @@ class _Entry:
 
 
 class LLMCache:
-    def __init__(self, directory, mode, threshold, max_entries):
+    def __init__(self, path, mode, threshold, max_entries):
         self.mode = mode
-        self._dir = directory
+        self._path = path
         self._threshold = threshold
         self._max_entries = max_entries
         self._entries = {}
-        self._bad_files = set()
+        self._offset = 0
         self._lock = threading.Lock()
         self._inflight = {}
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self._refresh()
         logger.info(
-            "LLM cache: mode=%s dir=%s entries=%d threshold=%.2f",
+            "LLM cache: mode=%s path=%s entries=%d threshold=%.2f",
             mode,
-            directory,
+            path,
             len(self._entries),
             threshold,
         )
 
     def lookup(self, key):
         """Return a stored response for the request, or None."""
-        entry = self._entries.get(key.digest) or self._load_file(key.digest)
+        entry = self._entries.get(key.digest)
         if entry is None:
             self._refresh()
             entry = self._entries.get(key.digest)
@@ -229,21 +230,16 @@ class LLMCache:
                 key.digest[:12],
             )
             return
-        document = {"request": key.request, "response": cleaned}
-        fd, tmp_path = tempfile.mkstemp(
-            dir=self._dir, prefix=".tmp-", suffix=".part"
-        )
+        document = {
+            "digest": key.digest,
+            "request": key.request,
+            "response": cleaned,
+        }
+        line = json.dumps(document, sort_keys=True) + "\n"
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(document, f, indent=2, sort_keys=True)
-                f.write("\n")
-            os.replace(tmp_path, self._path(key.digest))
+            self._append(line.encode("utf-8"))
         except OSError:
             logger.exception("LLM cache: could not store %s", key.digest[:12])
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
             return
         with self._lock:
             self._entries[key.digest] = _Entry(key.digest, key, cleaned)
@@ -269,48 +265,71 @@ class LLMCache:
         self.store(key, response)
         return response
 
-    def _path(self, digest):
-        return os.path.join(self._dir, digest + ".json")
-
-    def _load_file(self, digest):
-        if digest in self._bad_files:
-            return None
-        try:
-            with open(self._path(digest), encoding="utf-8") as f:
-                data = json.load(f)
-            entry = _Entry(digest, CacheKey(data["request"]), data["response"])
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            logger.warning(
-                "LLM cache: skipping unreadable entry %s: %s",
-                self._path(digest),
-                exc,
-            )
-            self._bad_files.add(digest)
-            return None
-        with self._lock:
-            self._entries[digest] = entry
-        return entry
+    def _append(self, line):
+        fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o644)
+        with os.fdopen(fd, "r+b") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            end = f.seek(0, os.SEEK_END)
+            # Start on a fresh line even if a crashed writer left the
+            # previous one truncated.
+            if end > 0:
+                f.seek(end - 1)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
+            f.write(line)
+            f.flush()
 
     def _refresh(self):
-        try:
-            names = os.listdir(self._dir)
-        except OSError as exc:
-            logger.warning("LLM cache: cannot list %s: %s", self._dir, exc)
+        with self._lock:
+            try:
+                size = os.path.getsize(self._path)
+            except OSError:
+                return
+            if size < self._offset:
+                # The file shrank (e.g. hand-pruned during development);
+                # re-read it from the start.
+                self._offset = 0
+            if size == self._offset:
+                return
+            try:
+                with open(self._path, "rb") as f:
+                    f.seek(self._offset)
+                    chunk = f.read()
+            except OSError as exc:
+                logger.warning(
+                    "LLM cache: cannot read %s: %s", self._path, exc
+                )
+                return
+            # Consume only complete lines; a trailing fragment still
+            # being written is re-read once its newline lands.
+            complete = chunk.rfind(b"\n") + 1
+            for line in chunk[:complete].splitlines():
+                self._add_line(line)
+            self._offset += complete
+
+    def _add_line(self, line):
+        line = line.strip()
+        if not line:
             return
-        for name in names:
-            if name.endswith(".json"):
-                digest = name[: -len(".json")]
-                if digest not in self._entries:
-                    self._load_file(digest)
+        try:
+            data = json.loads(line)
+            key = CacheKey(data["request"])
+            entry = _Entry(key.digest, key, data["response"])
+        except (ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "LLM cache: skipping unreadable line in %s: %s",
+                self._path,
+                exc,
+            )
+            return
+        self._entries[key.digest] = entry
 
     def _closest(self, key):
         if key.messages_repr is None:
             return None, 0.0
         best = None
         best_score = -1.0
-        for entry in self._entries.values():
+        for entry in list(self._entries.values()):
             if (
                 entry.messages_repr is None
                 or entry.n_messages != key.n_messages
@@ -355,9 +374,9 @@ def get_cache(model_name):
         cache = _caches.get(model_name)
         if cache is None:
             cache = LLMCache(
-                directory=os.path.join(
+                path=os.path.join(
                     os.getenv("LLM_CACHE_DIR", "fixtures/llm_cache"),
-                    model_name.replace("/", "_"),
+                    model_name.replace("/", "_") + ".jsonl",
                 ),
                 mode=_resolve_mode(),
                 threshold=float(
