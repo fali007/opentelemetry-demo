@@ -4,7 +4,7 @@
 # Two-stage build: Generate service-centric Markdown with Weaver, then serve with mkdocs
 
 # Stage 1: Generate Markdown files from telemetry schema using Weaver
-FROM docker.io/otel/weaver:v0.24.2@sha256:d1fb16d279f39810c340fbbf1cf9e5e995a3a9cefa531938e9012437e3bc00c1 AS registry-builder
+FROM docker.io/otel/weaver:v0.25.0@sha256:bef6000b4a4be46f81242f9ee785e0ebf0604606c15f92cb54a59893a741ec0c AS registry-builder
 
 WORKDIR /workspace
 
@@ -29,7 +29,7 @@ RUN /weaver/weaver registry package \
     --v2
 
 # Stage 2: Build static site
-FROM docker.io/library/python:3.14.6-slim-bookworm@sha256:4ff4b92a68355dbdb52584ab3391dff8d371a61d4e063468bfd0130e3189c6d9 AS site-builder
+FROM docker.io/library/python:3.14.6-slim-bookworm@sha256:86f975aca15cf04a40b399eebede9aea7c82eae084d1f1a0a6ef6bcaae871a30 AS site-builder
 
 WORKDIR /app
 
@@ -44,7 +44,7 @@ RUN mv /app/docs/mkdocs.yml /app/mkdocs.yml && \
     mkdocs build --clean
 
 # Stage 3: Serve with nginx (tiny!)
-FROM docker.io/nginxinc/nginx-unprivileged:1.31.2-alpine3.23-otel@sha256:aef4532d72b40b2616fd57f114dea8512bc6fbae47f690eabd38d766662baaf8
+FROM docker.io/nginxinc/nginx-unprivileged:1.31.2-alpine3.23-otel@sha256:1490cbf02ddba36ae75ef947b570166c805a178898ebfbc3bb889e7580820052
 
 USER 101
 
